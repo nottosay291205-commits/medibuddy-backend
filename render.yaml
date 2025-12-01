@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: medibuddy-backend
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        value: "sqlite:///./medibuddy.db"
+      - key: GOOGLE_SERVICE_ACCOUNT_FILE
+        value: "medibuddy.json"
+      - key: SECRET_KEY
+        value: "secret"
