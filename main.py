@@ -3,7 +3,6 @@ import os
 import json
 import threading
 import time
-from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -65,13 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------- Ensure uploads directory exists before mounting StaticFiles -------
-BASE_DIR = Path(__file__).resolve().parent
-uploads_dir = BASE_DIR / "uploads"
-uploads_dir.mkdir(parents=True, exist_ok=True)
-
-app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
-# ------------------------------------------------------------------------
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # ===================== MODELS =====================
 
@@ -79,24 +72,20 @@ class ChatRequest(BaseModel):
     message: str
     phone: str = ""
 
-
 class ReminderCreate(BaseModel):
     phone: str
     medicine: str
     timestamp: int
     day: int = 1
 
-
 class Profile(BaseModel):
     phone: str
     name: str
     email: str
 
-
 class TokenModel(BaseModel):
     phone: str
     token: str
-
 
 class Review(BaseModel):
     name: str
@@ -172,13 +161,11 @@ def chat(req: ChatRequest):
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # ensure directory exists (redundant but safe)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    file_path = uploads_dir / file.filename
+    os.makedirs("uploads", exist_ok=True)
+    file_path = f"uploads/{file.filename}"
     with open(file_path, "wb") as f:
         f.write(await file.read())
-    # return path relative to mounted static URL
-    return {"ok": True, "path": f"/uploads/{file.filename}"}
+    return {"ok": True, "path": file_path}
 
 
 reviews_db = "reviews.json"
