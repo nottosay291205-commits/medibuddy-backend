@@ -1,237 +1,224 @@
 # main.py
 import os
 import json
-import threading
-import time
-from fastapi import FastAPI, UploadFile, File, Form
+import uuid
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from firebase_admin import credentials, initialize_app, messaging
-from sqlalchemy import create_engine, Column, String, Integer, Boolean
-from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Load env for local use
-load_dotenv()
+# ---------------------
+# Ensure folders exist
+# ---------------------
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("data", exist_ok=True)
 
-# ------------------ ENV ------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./medibuddy.db")
-SERVICE_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "medibuddy.json")
-PORT = int(os.getenv("PORT", 8000))
+# ---------------------
+# Simple JSON storage helpers
+# ---------------------
+def _load_json(filename, default):
+    path = os.path.join("data", filename)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default, f)
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-# ------------------ DB ------------------
-Base = declarative_base()
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+def _save_json(filename, obj):
+    path = os.path.join("data", filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
+# initialize basic data files if missing
+_load_json("reminders.json", [])
+_load_json("reviews.json", [])
+_load_json("profiles.json", {})
+_load_json("tokens.json", {})
 
-class Reminder(Base):
-    __tablename__ = "reminders"
-    id = Column(Integer, primary_key=True, index=True)
-    phone = Column(String)
-    medicine = Column(String)
-    timestamp = Column(Integer)
-    day = Column(Integer)
-    taken = Column(Boolean, default=False)
-
-
-class User(Base):
-    __tablename__ = "users"
-    phone = Column(String, primary_key=True)
-    name = Column(String, default="")
-    email = Column(String, default="")
-    token = Column(String, default="")
-
-
-Base.metadata.create_all(engine)
-
-# ------------------ FIREBASE ------------------
+# ---------------------
+# Firebase admin init (safe for Render)
+# ---------------------
+firebase_admin = None
+messaging = None
 try:
-    cred = credentials.Certificate(SERVICE_FILE)
-    initialize_app(cred)
+    import firebase_admin
+    from firebase_admin import credentials, messaging as fcm_messaging
+
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    cred = None
+    if sa_json:
+        # sa_json may be the raw JSON string or a file path
+        try:
+            sa = json.loads(sa_json)
+            cred = credentials.Certificate(sa)
+        except Exception:
+            # maybe it's a path on disk
+            if os.path.exists(sa_json):
+                cred = credentials.Certificate(sa_json)
+
+    # fallback: if medibuddy.json exists (local dev)
+    if not cred and os.path.exists("medibuddy.json"):
+        cred = credentials.Certificate("medibuddy.json")
+
+    if cred:
+        try:
+            firebase_admin.initialize_app(cred)
+            firebase_admin = firebase_admin
+            messaging = fcm_messaging
+            print("Firebase admin initialized")
+        except Exception as e:
+            # already initialized or other issue
+            print("Firebase admin init warning:", str(e))
+    else:
+        print("Firebase admin not initialized — no service account found (okay for dev).")
 except Exception as e:
-    print("Firebase init error:", e)
+    print("Firebase admin library not installed or failed to load:", str(e))
 
-# ------------------ FASTAPI ------------------
-app = FastAPI()
+# ---------------------
+# FastAPI app
+# ---------------------
+app = FastAPI(title="MediBuddy Backend (simple)")
 
+# Allow CORS from your frontend (you can tighten this later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # FRONTEND runs on Vercel
+    allow_origins=["*"],  # set to your domain in production (e.g. https://frontend-medibuddy.vercel.app)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Expose uploads as static files
+# (uploads dir already created above to avoid startup error)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# ===================== MODELS =====================
+# ---------------------
+# Helpers
+# ---------------------
+def _new_id():
+    return uuid.uuid4().hex
 
-class ChatRequest(BaseModel):
-    message: str
-    phone: str = ""
-
-class ReminderCreate(BaseModel):
-    phone: str
-    medicine: str
-    timestamp: int
-    day: int = 1
-
-class Profile(BaseModel):
-    phone: str
-    name: str
-    email: str
-
-class TokenModel(BaseModel):
-    phone: str
-    token: str
-
-class Review(BaseModel):
-    name: str
-    text: str
-    rating: int
-    phone: str | None = None
-
-# -------------------------------------------------------
-#                      ENDPOINTS
-# -------------------------------------------------------
-
-@app.post("/api/token/register")
-def register_token(data: TokenModel):
-    db = SessionLocal()
-    user = db.query(User).filter_by(phone=data.phone).first()
-    if not user:
-        user = User(phone=data.phone, token=data.token)
-        db.add(user)
-    else:
-        user.token = data.token
-    db.commit()
-    return {"ok": True}
-
-
-@app.post("/api/profile")
-def save_profile(p: Profile):
-    db = SessionLocal()
-    user = db.query(User).filter_by(phone=p.phone).first()
-    if not user:
-        user = User(phone=p.phone, name=p.name, email=p.email)
-        db.add(user)
-    else:
-        user.name = p.name
-        user.email = p.email
-    db.commit()
-    return {"ok": True}
-
+# ---------------------
+# API endpoints
+# ---------------------
 
 @app.get("/api/reminders")
-def get_reminders():
-    db = SessionLocal()
-    items = db.query(Reminder).all()
-    return [dict(
-        id=i.id,
-        phone=i.phone,
-        medicine=i.medicine,
-        timestamp=i.timestamp,
-        day=i.day,
-        taken=i.taken
-    ) for i in items]
-
+async def list_reminders():
+    data = _load_json("reminders.json", [])
+    # ensure numeric timestamps
+    return JSONResponse(data)
 
 @app.post("/api/reminders")
-def create_reminder(r: ReminderCreate):
-    db = SessionLocal()
-    rem = Reminder(
-        phone=r.phone,
-        medicine=r.medicine,
-        timestamp=r.timestamp,
-        day=r.day,
-    )
-    db.add(rem)
-    db.commit()
-    db.refresh(rem)
-    return {"ok": True, "id": rem.id}
-
+async def create_reminder(payload: Dict[str, Any]):
+    data = _load_json("reminders.json", [])
+    # Ensure required fields exist
+    reminder = {
+        "id": _new_id(),
+        "medicine": payload.get("medicine"),
+        "timestamp": int(payload.get("timestamp") or 0),
+        "phone": payload.get("phone"),
+        "day": payload.get("day", 1),
+        "created_at": int(datetime.utcnow().timestamp() * 1000),
+        "taken": False
+    }
+    data.append(reminder)
+    _save_json("reminders.json", data)
+    return JSONResponse({"ok": True, "id": reminder["id"]})
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
-    bot_reply = f"Your message: {req.message}\nThis is a demo reply."
-    return {"reply": bot_reply}
+async def chat_endpoint(payload: Dict[str, Any]):
+    # Minimal placeholder chat logic. Replace with real AI logic / backend later.
+    message = payload.get("message", "")
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+    # naive reply — echo + safe suggestion
+    reply = f"I got your message: \"{message}\". MediMitra suggests to check medicine label and consult a doctor for medical questions."
+    return JSONResponse({"reply": reply})
 
+@app.get("/api/reviews")
+async def get_reviews():
+    data = _load_json("reviews.json", [])
+    return JSONResponse(data)
+
+@app.post("/api/reviews")
+async def post_review(payload: Dict[str, Any]):
+    data = _load_json("reviews.json", [])
+    review = {
+        "id": _new_id(),
+        "name": payload.get("name") or "Anonymous",
+        "text": payload.get("text") or "",
+        "rating": int(payload.get("rating") or 0),
+        "phone": payload.get("phone"),
+        "created_at": int(datetime.utcnow().timestamp() * 1000),
+    }
+    data.append(review)
+    _save_json("reviews.json", data)
+    return JSONResponse({"ok": True, "id": review["id"]})
+
+@app.post("/api/profile")
+async def save_profile(payload: Dict[str, Any]):
+    profiles = _load_json("profiles.json", {})
+    phone = payload.get("phone")
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone required")
+    profiles[phone] = {
+        "name": payload.get("name"),
+        "email": payload.get("email"),
+        "notes": payload.get("notes") or profiles.get(phone, {}).get("notes"),
+        "updated_at": int(datetime.utcnow().timestamp() * 1000)
+    }
+    _save_json("profiles.json", profiles)
+    return JSONResponse({"ok": True})
+
+@app.post("/api/token/register")
+async def register_token(payload: Dict[str, Any]):
+    tokens = _load_json("tokens.json", {})
+    phone = payload.get("phone")
+    token = payload.get("token")
+    if not phone or not token:
+        raise HTTPException(status_code=400, detail="phone and token required")
+    tokens[phone] = token
+    _save_json("tokens.json", tokens)
+
+    # Try to send a test notification (best-effort)
+    if messaging:
+        try:
+            message = {
+                "token": token,
+                "notification": {"title": "MediBuddy", "body": "Notifications enabled for this device."},
+            }
+            # send may raise if invalid token or permission issues
+            messaging.send(message)
+        except Exception as e:
+            print("FCM send warning:", str(e))
+
+    return JSONResponse({"ok": True})
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    os.makedirs("uploads", exist_ok=True)
-    file_path = f"uploads/{file.filename}"
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-    return {"ok": True, "path": file_path}
+    # save uploaded file to uploads/ and return its public path
+    filename = file.filename or f"upload-{_new_id()}"
+    safe_name = f"{_new_id()}-{filename.replace(' ', '_')}"
+    save_path = os.path.join("uploads", safe_name)
+    try:
+        with open(save_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to save: {e}")
+    public_url = f"/uploads/{safe_name}"
+    return JSONResponse({"ok": True, "path": public_url, "filename": safe_name})
 
-
-reviews_db = "reviews.json"
-
-
-@app.get("/api/reviews")
-def get_reviews():
-    if not os.path.exists(reviews_db):
-        return []
-    with open(reviews_db) as f:
-        return json.load(f)
-
-
-@app.post("/api/reviews")
-def save_review(r: Review):
-    all_reviews = []
-    if os.path.exists(reviews_db):
-        all_reviews = json.load(open(reviews_db))
-
-    all_reviews.append({
-        "name": r.name,
-        "text": r.text,
-        "rating": r.rating,
-        "phone": r.phone,
-        "created_at": int(time.time() * 1000)
-    })
-    json.dump(all_reviews, open(reviews_db, "w"))
-    return {"ok": True}
-
-
-# -------------------------------------------------------
-#                  REMINDER WORKER
-# -------------------------------------------------------
-
-def worker():
-    while True:
-        try:
-            db = SessionLocal()
-            now = int(time.time() * 1000)
-
-            due = db.query(Reminder).filter(
-                Reminder.timestamp <= now,
-                Reminder.taken == False
-            ).all()
-
-            for r in due:
-                user = db.query(User).filter_by(phone=r.phone).first()
-                if user and user.token:
-                    try:
-                        messaging.send(messaging.Message(
-                            notification=messaging.Notification(
-                                title="Medicine Reminder",
-                                body=f"Time to take {r.medicine}"
-                            ),
-                            token=user.token
-                        ))
-                    except:
-                        pass
-
-                r.taken = True
-                db.commit()
-
-        except Exception as e:
-            print("Worker error:", e)
-
-        time.sleep(10)
-
-
-threading.Thread(target=worker, daemon=True).start()
+# ---------------------
+# Root / health
+# ---------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "time": int(datetime.utcnow().timestamp() * 1000)}
